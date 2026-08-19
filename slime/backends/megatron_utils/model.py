@@ -30,6 +30,7 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.train_lifecycle import OptimizerStepOutcome, OptimizerStepStatus, TrainBatchOutcome
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
@@ -517,7 +518,7 @@ def train_one_step(
     num_microbatches: int,
     step_global_batch_size: int,
     microbatch_pbar=None,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, OptimizerStepOutcome]:
     """Execute a single pipeline-parallel training step.
 
     Runs forward/backward over ``num_microbatches``, applies optimizer step and
@@ -541,8 +542,8 @@ def train_one_step(
             equals the per-step sample count, so behavior is unchanged.
 
     Returns:
-        tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
-        and gradient norm for logging.
+        Reduced loss dictionary (last stage only), gradient norm for logging,
+        and a typed record of whether this invocation committed an optimizer step.
     """
     args = get_args()
 
@@ -593,6 +594,7 @@ def train_one_step(
                     "rollout_log_probs",
                     "teacher_log_probs",
                     "rollout_mask_sums",
+                    "metadata",
                     # Only present when dumping train debug data; lets the loss
                     # snapshot each sample's log_probs keyed by rollout position.
                     *(["partition"] if args.save_debug_train_data is not None else []),
@@ -682,6 +684,14 @@ def train_one_step(
         assert update_successful
         opt_param_scheduler.step(increment=step_global_batch_size)
 
+    step_outcome = OptimizerStepOutcome(
+        rollout_id=rollout_id,
+        step_id=step_id,
+        status=OptimizerStepStatus.COMMITTED if valid_step else OptimizerStepStatus.SKIPPED,
+        global_batch_size=step_global_batch_size,
+        reason=None if valid_step else "non_finite_gradient",
+    )
+
     # release grad
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
@@ -695,8 +705,8 @@ def train_one_step(
             cp_size=mpu.get_context_parallel_world_size(),
             dp_with_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),
         )
-        return loss_reduced, grad_norm
-    return {}, grad_norm
+        return loss_reduced, grad_norm, step_outcome
+    return {}, grad_norm, step_outcome
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
@@ -712,7 +722,7 @@ def train(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     global_batch_sizes: Sequence[int],
-) -> None:
+) -> TrainBatchOutcome:
     """Run training over a rollout consisting of multiple steps.
 
     The model is switched to train mode, training hooks are configured, and
@@ -820,11 +830,13 @@ def train(
         disable=_disable_tqdm_for_non_main_rank(),
     )
 
+    step_outcomes: list[OptimizerStepOutcome] = []
+
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
 
         # Run training step.
-        loss_dict, grad_norm = train_one_step(
+        loss_dict, grad_norm, step_outcome = train_one_step(
             args,
             rollout_id,
             step_id,
@@ -836,6 +848,7 @@ def train(
             global_batch_sizes[step_id],
             microbatch_pbar=microbatch_pbar,
         )
+        step_outcomes.append(step_outcome)
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
@@ -938,6 +951,7 @@ def train(
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
+    return TrainBatchOutcome(rollout_id=rollout_id, optimizer_steps=tuple(step_outcomes))
 
 
 def save(

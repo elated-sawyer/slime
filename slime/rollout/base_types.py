@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
+from slime.utils.train_lifecycle import RolloutSkipReason
 from slime.utils.types import Sample
 
 
@@ -8,6 +9,11 @@ from slime.utils.types import Sample
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
     metrics: dict[str, Any] = None
+    skip_reason: RolloutSkipReason | None = None
+
+    def __post_init__(self):
+        if self.skip_reason is not None and self.samples:
+            raise ValueError("skipped rollout output cannot also contain samples")
 
 
 @dataclass

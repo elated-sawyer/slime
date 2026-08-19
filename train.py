@@ -4,10 +4,17 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.train_lifecycle import (
+    RolloutSkipReason,
+    SkippedTrainBatch,
+    TrainerLifecycleController,
+    consolidate_train_batch_outcomes,
+)
 
 
 def train(args):
     configure_logger()
+    lifecycle = TrainerLifecycleController.from_args(args)
     release_train = args.release_train
 
     # allocate the GPUs
@@ -19,6 +26,7 @@ def train(args):
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    lifecycle.run_restored(args.start_rollout_id)
 
     if args.offload_rollout and not release_train:
         ray.get(rollout_manager.onload_weights.remote())
@@ -52,6 +60,16 @@ def train(args):
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
+        if isinstance(rollout_data_ref, SkippedTrainBatch):
+            lifecycle.batch_skipped(rollout_data_ref)
+            if args.rollout_global_dataset and should_run_periodic_action(
+                rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+            ):
+                ray.get(rollout_manager.save.remote(rollout_id))
+            if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+                ray.get(rollout_manager.eval.remote(rollout_id))
+            continue
+
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
 
@@ -59,14 +77,34 @@ def train(args):
             actor_model.create()
 
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
-        if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
-            if actor_trains:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+        actor_outcome = None
+        try:
+            if args.use_critic:
+                value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
+                if actor_trains:
+                    actor_outcome = consolidate_train_batch_outcomes(
+                        ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+                    )
+                else:
+                    ray.get(value_refs)
             else:
-                ray.get(value_refs)
+                actor_outcome = consolidate_train_batch_outcomes(
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+                )
+        except BaseException as exc:
+            lifecycle.batch_failed(rollout_id, exc)
+            raise
+
+        if actor_outcome is not None:
+            lifecycle.optimizer_outcome(actor_outcome)
         else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+            lifecycle.batch_skipped(
+                SkippedTrainBatch(
+                    rollout_id=rollout_id,
+                    reason=RolloutSkipReason(reason_code="actor_not_scheduled"),
+                )
+            )
+        actor_updated = actor_outcome is not None and actor_outcome.actor_updated
 
         if release_train or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
@@ -82,7 +120,8 @@ def train(args):
         offload_train(actor_trains)
         if args.offload_rollout and not release_train:
             ray.get(rollout_manager.onload_weights.remote())
-        actor_model.update_weights()
+        if actor_updated or release_train:
+            actor_model.update_weights()
 
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
@@ -91,6 +130,7 @@ def train(args):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
     ray.get(rollout_manager.dispose.remote())
+    lifecycle.run_finished()
     finish_tracking(args)
 
 

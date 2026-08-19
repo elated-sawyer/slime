@@ -27,6 +27,7 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.train_lifecycle import RolloutSkipReason, SkippedTrainBatch
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -594,12 +595,23 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        data, metrics, skip_reason = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
+        if skip_reason is not None:
+            logger.warning(
+                "Skipping rollout batch %s before training: %s (%s)",
+                rollout_id,
+                skip_reason.reason_code,
+                skip_reason.message,
+            )
+            return SkippedTrainBatch(rollout_id=rollout_id, reason=skip_reason)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
-            # if debug rollout only, we don't convert samples to train data and directly return
-            return
+            # Generation completed, but this mode intentionally has no actor update.
+            return SkippedTrainBatch(
+                rollout_id=rollout_id,
+                reason=RolloutSkipReason(reason_code="debug_rollout_only"),
+            )
         data = self._convert_samples_to_train_data(data)
         return self._split_train_data_by_dp(data)
 
@@ -683,10 +695,19 @@ class RolloutManager:
                     f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}"
                 )
             metrics = None
+            skip_reason = None
         else:
-            data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
-            metrics = data.metrics
-            data = data.samples
+            result = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
+            metrics = result.metrics
+            skip_reason = result.skip_reason
+            data = result.samples
+            if skip_reason is not None:
+                return [], metrics, skip_reason
+            if not data:
+                raise ValueError(
+                    "rollout returned no samples without an explicit RolloutSkipReason; "
+                    "return RolloutFnTrainOutput(samples=[], skip_reason=...) for a skipped batch"
+                )
             # Enforce the rollout_id contract before flattening: any list[Sample]
             # encountered in the nested output must have rollout_id set on every
             # element. Default rollouts inherit it from the data source; compact /
@@ -698,7 +719,7 @@ class RolloutManager:
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
 
-        return data, metrics
+        return data, metrics, skip_reason
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
@@ -851,7 +872,7 @@ class RolloutManager:
                 _validate_rollout_routed_experts_for_replay(routed_experts, self.args)
             train_data["rollout_routed_experts"] = routed_experts
 
-        if samples[0].train_metadata is not None:
+        if any(sample.train_metadata is not None for sample in samples):
             train_data["metadata"] = [sample.train_metadata for sample in samples]
 
         if any(sample.multimodal_train_inputs is not None for sample in samples):
@@ -915,6 +936,7 @@ class RolloutManager:
                 "source_names",
                 "prompt",
                 "teacher_log_probs",
+                "metadata",
             ]:
                 if key not in data:
                     continue

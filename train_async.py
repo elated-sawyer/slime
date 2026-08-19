@@ -4,12 +4,19 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.train_lifecycle import (
+    RolloutSkipReason,
+    SkippedTrainBatch,
+    TrainerLifecycleController,
+    consolidate_train_batch_outcomes,
+)
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
 def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
     configure_logger()
+    lifecycle = TrainerLifecycleController.from_args(args)
     release_train = args.release_train
     # allocate the GPUs
     pgs = create_placement_groups(args)
@@ -21,6 +28,7 @@ def train(args):
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    lifecycle.run_restored(args.start_rollout_id)
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()
@@ -30,6 +38,7 @@ def train(args):
 
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
+    weights_dirty = False
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
         if rollout_data_next_future is not None:
@@ -39,19 +48,53 @@ def train(args):
         if rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
+        if isinstance(rollout_data_curr_ref, SkippedTrainBatch):
+            lifecycle.batch_skipped(rollout_data_curr_ref)
+            if args.rollout_global_dataset and should_run_periodic_action(
+                rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+            ):
+                ray.get(rollout_manager.save.remote(rollout_id))
+            if weights_dirty and (release_train or (rollout_id + 1) % args.update_weights_interval == 0):
+                rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+                rollout_data_next_future = None
+                actor_model.update_weights()
+                weights_dirty = False
+            if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+                ray.get(rollout_manager.eval.remote(rollout_id))
+            continue
+
         if release_train:
             actor_model.create()
 
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
-        if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
-            if actor_trains:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
+        actor_outcome = None
+        try:
+            if args.use_critic:
+                value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+                if actor_trains:
+                    actor_outcome = consolidate_train_batch_outcomes(
+                        ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
+                    )
+                else:
+                    ray.get(value_refs)
             else:
-                ray.get(value_refs)
-        else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+                actor_outcome = consolidate_train_batch_outcomes(
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+                )
+        except BaseException as exc:
+            lifecycle.batch_failed(rollout_id, exc)
+            raise
 
+        if actor_outcome is not None:
+            lifecycle.optimizer_outcome(actor_outcome)
+            weights_dirty = weights_dirty or actor_outcome.actor_updated
+        else:
+            lifecycle.batch_skipped(
+                SkippedTrainBatch(
+                    rollout_id=rollout_id,
+                    reason=RolloutSkipReason(reason_code="actor_not_scheduled"),
+                )
+            )
         if release_train or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
         ):
@@ -63,16 +106,18 @@ def train(args):
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
 
-        if release_train or (rollout_id + 1) % args.update_weights_interval == 0:
+        if release_train or (weights_dirty and (rollout_id + 1) % args.update_weights_interval == 0):
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None
             actor_model.update_weights()
+            weights_dirty = False
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
     ray.get(rollout_manager.dispose.remote())
+    lifecycle.run_finished()
     finish_tracking(args)
 
 

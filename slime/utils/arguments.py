@@ -503,6 +503,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--custom-train-lifecycle-factory-path",
+                type=str,
+                default=None,
+                help=(
+                    "Driver-side factory path: factory(args) -> TrainerLifecycleParticipant. "
+                    "The participant receives typed skipped-batch and actual optimizer-step "
+                    "outcomes exactly once in both sync and async drivers. Methods must be synchronous."
+                ),
+            )
+            parser.add_argument(
                 "--custom-eval-rollout-log-function-path",
                 type=str,
                 default=None,
