@@ -119,7 +119,12 @@ class OpenAIResponsesAdapter(BaseAdapter):
                 direction="request",
                 sequence=0,
                 content_type="application/json",
-                payload=json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                payload=json.dumps(
+                    body,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
                 final=True,
             )
         )
