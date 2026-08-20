@@ -118,6 +118,22 @@ class CodexHarness(BaseHarness):
                 raise ValueError(f"{self.extra_envs_env} must be a JSON object of string values")
             env.update(configured)
         env.update(ctx.extra_env)
+        if self.wire_api(ctx) == "responses":
+            # The configured adapter URL is the intended direct route. Ambient
+            # host/image proxies can otherwise intercept sandbox-to-adapter
+            # traffic and make session routing depend on deployment state.
+            env.update(
+                {
+                    "HTTP_PROXY": "",
+                    "HTTPS_PROXY": "",
+                    "ALL_PROXY": "",
+                    "http_proxy": "",
+                    "https_proxy": "",
+                    "all_proxy": "",
+                    "NO_PROXY": "*",
+                    "no_proxy": "*",
+                }
+            )
         env.update(
             {
                 "HOME": ctx.home_dir,

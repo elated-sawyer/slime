@@ -176,7 +176,11 @@ def test_codex_responses_root_profile_config_and_launch(monkeypatch):
             sid="sess-root",
             execution_user="root",
             home_dir="/root",
-            extra_env={"VIRTUAL_ENV": "/opt/task", "OPENAI_API_KEY": "must-not-win"},
+            extra_env={
+                "VIRTUAL_ENV": "/opt/task",
+                "OPENAI_API_KEY": "must-not-win",
+                "HTTP_PROXY": "http://must-not-win.invalid",
+            },
             model_context_window=32768,
             model_label="qwen-baseline",
             wire_api="responses",
@@ -209,6 +213,8 @@ def test_codex_responses_root_profile_config_and_launch(monkeypatch):
         assert captured["env"]["CODEX_HOME"] == "/root/.codex"
         assert captured["env"]["VIRTUAL_ENV"] == "/opt/task"
         assert captured["env"]["OPENAI_API_KEY"] == "sess-root"
+        assert captured["env"]["HTTP_PROXY"] == ""
+        assert captured["env"]["NO_PROXY"] == "*"
 
     asyncio.run(run_case())
 
