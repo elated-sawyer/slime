@@ -203,10 +203,19 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
     args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    # ``train.py`` intentionally supports ``num_rollout == 0`` as an
+    # evaluation-only run. The actor still creates an optimizer so it can use
+    # the regular checkpoint-loading and weight-sync path, while Megatron's
+    # scheduler requires positive decay and weight-decay schedule lengths.
+    # Keep the actual training iteration count at zero and use a one-step
+    # placeholder only for scheduler construction.
+    scheduler_train_iters = args.train_iters
+    if args.num_rollout == 0 and args.eval_interval is not None:
+        scheduler_train_iters = 1
     if args.lr_decay_iters is None:
-        args.lr_decay_iters = args.train_iters
+        args.lr_decay_iters = scheduler_train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-    wd_incr_steps = args.train_iters * args.global_batch_size
+    wd_incr_steps = scheduler_train_iters * args.global_batch_size
     wsd_decay_steps = None
     if args.lr_wsd_decay_iters is not None:
         wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
