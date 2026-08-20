@@ -559,6 +559,49 @@ def test_max_turns_per_sid_returns_429():
     asyncio.run(run_case())
 
 
+def test_session_turn_cap_overrides_adapter_fallback():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 501)], [(-0.1, 502)], [(-0.1, 503)]]) as sglang:
+            tok = FakeTokenizer()
+            adapter = anthropic.AnthropicAdapter(
+                tokenizer=tok,
+                sglang_url=sglang.url,
+                max_turns_per_sid=2,
+                require_registered_session=True,
+            )
+            adapter.open_session("sid-one", max_turns=1)
+            adapter.open_session("sid-fallback")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": "x"}]}
+            try:
+                one_first = await client.post(
+                    "/v1/messages", headers={"Authorization": "Bearer sid-one"}, json=body
+                )
+                one_second = await client.post(
+                    "/v1/messages", headers={"Authorization": "Bearer sid-one"}, json=body
+                )
+                fallback_first = await client.post(
+                    "/v1/messages", headers={"Authorization": "Bearer sid-fallback"}, json=body
+                )
+                fallback_second = await client.post(
+                    "/v1/messages", headers={"Authorization": "Bearer sid-fallback"}, json=body
+                )
+                fallback_third = await client.post(
+                    "/v1/messages", headers={"Authorization": "Bearer sid-fallback"}, json=body
+                )
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-one")
+            await _drain(adapter, "sid-fallback")
+
+        assert [one_first.status, one_second.status] == [200, 429]
+        assert [fallback_first.status, fallback_second.status, fallback_third.status] == [200, 200, 429]
+        assert len(sglang.requests) == 3
+
+    asyncio.run(run_case())
+
+
 def test_strict_session_mode_rejects_unknown_bearer_before_generation():
     async def run_case():
         async with FakeSGLangServer([[(-0.1, 501)]]) as sglang:

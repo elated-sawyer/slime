@@ -40,6 +40,7 @@ class Session:
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
+    max_turns: int | None = None
 
 
 @dataclasses.dataclass
@@ -215,13 +216,17 @@ class BaseAdapter:
         *,
         sampling_defaults: dict | None = None,
         max_context_tokens: int = 0,
+        max_turns: int | None = None,
     ) -> None:
         """Register a fresh per-sid Session; sids must be unique."""
         if sid in self.store:
             raise ValueError(f"session_id {sid!r} already exists; sids must be unique per agent run")
+        if max_turns is not None and (isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1):
+            raise ValueError("max_turns must be a positive integer or None")
         self.store[sid] = Session(
             sampling_defaults=dict(sampling_defaults or {}),
             max_context_tokens=int(max_context_tokens or 0),
+            max_turns=max_turns,
         )
 
     async def shutdown_session(self, sid: str, *, wait_timeout: float = 5.0) -> None:
@@ -289,7 +294,10 @@ class BaseAdapter:
 
         Increments the per-sid counter as a side effect when under the cap.
         """
-        cap = self.max_turns_per_sid
+        session = self.store.get(sid)
+        cap = getattr(session, "max_turns", None)
+        if cap is None:
+            cap = self.max_turns_per_sid
         if cap is None:
             return None
         prior = self._sid_turn_count.get(sid, 0)
