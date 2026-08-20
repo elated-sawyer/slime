@@ -291,6 +291,9 @@ def log_rollout_data(
                 "num_microbatches",
                 "micro_batch_indices",
                 "source_names",
+                # Structured per-sample training metadata is transported to
+                # custom losses; it is not a numeric rollout metric.
+                "metadata",
                 # DP-local view of `raw_reward`, which this loop already logs;
                 # both reduce to the same mean, so skip the duplicate metric.
                 "local_raw_reward",

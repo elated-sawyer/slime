@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import torch
+
 from _runtime_import_stubs import install_megatron_import_stubs, install_sglang_import_stubs
 
 
 install_megatron_import_stubs()
 install_sglang_import_stubs()
 
+from slime.backends.megatron_utils import data as megatron_data
 from slime.backends.megatron_utils.data import DataIterator
 from slime.ray.rollout import RolloutManager
 from slime.utils.types import Sample
@@ -88,3 +91,48 @@ def test_no_train_metadata_keeps_legacy_batch_shape():
     manager = _manager()
     train_data = manager._convert_samples_to_train_data([_sample(0, 100, None), _sample(1, 101, None)])
     assert "metadata" not in train_data
+
+
+def test_rollout_logger_ignores_structured_train_metadata(monkeypatch):
+    monkeypatch.setattr(megatron_data.mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(megatron_data.mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(megatron_data.mpu, "get_context_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(
+        megatron_data.mpu,
+        "get_data_parallel_world_size",
+        lambda **_kwargs: 1,
+        raising=False,
+    )
+
+    captured = {}
+
+    def capture_log_data(metric_name, args, rollout_id, log_dict):
+        del args
+        captured.update(
+            metric_name=metric_name,
+            rollout_id=rollout_id,
+            log_dict=log_dict,
+        )
+        return None
+
+    monkeypatch.setattr(megatron_data, "gather_log_data", capture_log_data)
+    megatron_data.log_rollout_data(
+        7,
+        SimpleNamespace(
+            ci_test=False,
+            log_multi_turn=False,
+            log_passrate=False,
+            log_correct_samples=False,
+        ),
+        {
+            "response_lengths": [2],
+            "loss_masks": [torch.tensor([1, 1])],
+            "total_lengths": [3],
+            "global_batch_sizes": [1],
+            "metadata": [{"attempt_id": 100, "segment_id": "a"}],
+        },
+    )
+
+    assert captured["metric_name"] == "rollout"
+    assert captured["rollout_id"] == 7
+    assert "metadata" not in captured["log_dict"]
