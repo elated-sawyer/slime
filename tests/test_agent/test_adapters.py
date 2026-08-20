@@ -602,6 +602,67 @@ def test_session_turn_cap_overrides_adapter_fallback():
     asyncio.run(run_case())
 
 
+def test_locked_session_sampling_defaults_cannot_be_overridden_by_wire_body():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 501)], [(-0.1, 502)]]) as sglang:
+            adapter = openai_responses.OpenAIResponsesAdapter(
+                tokenizer=FakeTokenizer(),
+                sglang_url=sglang.url,
+                require_registered_session=True,
+                lock_sampling_defaults=True,
+            )
+            adapter.open_session(
+                "sid-locked",
+                sampling_defaults={
+                    "temperature": 0.2,
+                    "top_p": 0.8,
+                    "max_new_tokens": 128,
+                    "seed": 17,
+                },
+            )
+            adapter.open_session("sid-unset", sampling_defaults={"seed": 18})
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            body = {
+                "model": "m",
+                "input": "x",
+                "temperature": 0.9,
+                "top_p": 0.1,
+                "top_k": 5,
+                "max_output_tokens": 64,
+            }
+            try:
+                locked = await client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sid-locked"},
+                    json=body,
+                )
+                unset = await client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sid-unset"},
+                    json=body,
+                )
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-locked")
+            await _drain(adapter, "sid-unset")
+
+        assert locked.status == unset.status == 200
+        locked_sampling, unset_sampling = [item["sampling_params"] for item in sglang.requests]
+        assert locked_sampling["temperature"] == 0.2
+        assert locked_sampling["top_p"] == 0.8
+        assert locked_sampling["top_k"] == 5
+        assert locked_sampling["max_new_tokens"] == 128
+        assert locked_sampling["seed"] == 17
+        assert unset_sampling["temperature"] == 0.9
+        assert unset_sampling["top_p"] == 0.1
+        assert unset_sampling["top_k"] == 5
+        assert unset_sampling["max_new_tokens"] == 64
+        assert unset_sampling["seed"] == 18
+
+    asyncio.run(run_case())
+
+
 def test_strict_session_mode_rejects_unknown_bearer_before_generation():
     async def run_case():
         async with FakeSGLangServer([[(-0.1, 501)]]) as sglang:

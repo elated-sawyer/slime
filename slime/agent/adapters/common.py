@@ -150,6 +150,7 @@ class BaseAdapter:
         fork_threshold_tokens: int | None = None,
         debug_callback: Callable[..., None] | None = None,
         require_registered_session: bool = False,
+        lock_sampling_defaults: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
@@ -169,6 +170,7 @@ class BaseAdapter:
 
         self.debug_callback: Callable[..., None] | None = debug_callback
         self.require_registered_session = require_registered_session
+        self.lock_sampling_defaults = lock_sampling_defaults
         # per-sid turn cap: return 429 to kill the run once exceeded
         self.max_turns_per_sid: int | None = max_turns_per_sid
         self._sid_turn_count: dict[str, int] = {}
@@ -433,27 +435,39 @@ def sid_from_body(body: dict | None) -> str | None:
     return None
 
 
-def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...], stop_keys: tuple[str, ...]) -> dict:
+def _sampling_params(
+    session: Any,
+    body: dict,
+    *,
+    max_token_keys: tuple[str, ...],
+    stop_keys: tuple[str, ...],
+    lock_sampling_defaults: bool = False,
+) -> dict:
+    defaults = session.sampling_defaults or {}
     sp: dict[str, Any] = {
         "skip_special_tokens": False,
         "spaces_between_special_tokens": False,
         "no_stop_trim": True,
         "max_new_tokens": 4096,
-        **(session.sampling_defaults or {}),
+        **defaults,
     }
 
     for key in max_token_keys:
         if body.get(key) is not None:
-            sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", body[key])), int(body[key]))
+            if not lock_sampling_defaults or "max_new_tokens" not in defaults:
+                sp["max_new_tokens"] = min(
+                    int(sp.get("max_new_tokens", body[key])), int(body[key])
+                )
             break
 
     for src_k, dst_k in (("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k")):
-        if src_k in body:
+        if src_k in body and (not lock_sampling_defaults or dst_k not in defaults):
             sp[dst_k] = body[src_k]
 
     for key in stop_keys:
         if body.get(key):
-            sp["stop"] = body[key]
+            if not lock_sampling_defaults or "stop" not in defaults:
+                sp["stop"] = body[key]
             break
 
     return sp
@@ -472,7 +486,13 @@ async def call_sglang_generate(
     Module-level (not a method) so tests can monkeypatch it.
     """
     logger = adapter.logger
-    sp = _sampling_params(session, body, max_token_keys=adapter.max_token_keys, stop_keys=adapter.stop_keys)
+    sp = _sampling_params(
+        session,
+        body,
+        max_token_keys=adapter.max_token_keys,
+        stop_keys=adapter.stop_keys,
+        lock_sampling_defaults=adapter.lock_sampling_defaults,
+    )
 
     if session.max_context_tokens > 0:
         remaining_context = session.max_context_tokens - len(prompt_ids)
