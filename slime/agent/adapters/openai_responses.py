@@ -19,6 +19,8 @@ import json
 import logging
 import secrets
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from aiohttp import web
@@ -35,6 +37,25 @@ _CONTEXT_CUTOFF_TEXT = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ResponsesWireRecord:
+    """One application-wire chunk emitted for a completed Responses exchange.
+
+    Request JSON is captured in canonical UTF-8 form. Streaming response payloads
+    are the exact SSE chunks passed to aiohttp; non-streaming responses are the
+    exact JSON bytes returned to the client. The callback is a production audit
+    hook: exceptions propagate so a configured capture cannot fail silently.
+    """
+
+    session_id: str
+    exchange_id: str
+    direction: str
+    sequence: int
+    content_type: str
+    payload: bytes
+    final: bool
+
+
 class OpenAIResponsesAdapter(BaseAdapter):
     """Serve ``/v1/responses`` while retaining Slime's sampled token spans."""
 
@@ -42,6 +63,15 @@ class OpenAIResponsesAdapter(BaseAdapter):
     log_prefix = "openai_responses_adapter"
     max_token_keys = ("max_output_tokens", "max_tokens")
     stop_keys = ()
+
+    def __init__(
+        self,
+        *args,
+        wire_capture_callback: Callable[[ResponsesWireRecord], None] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.wire_capture_callback = wire_capture_callback
 
     def _register_routes(self, app: web.Application) -> None:
         app.router.add_post("/v1/responses", self._run_turn)
@@ -80,9 +110,56 @@ class OpenAIResponsesAdapter(BaseAdapter):
 
     async def _respond(self, request, body, reply, in_tok, out_tok, stream) -> web.StreamResponse:
         envelope = _response_envelope(body, reply.wire, in_tok, out_tok)
+        session_id = self._session_id(request, body)
+        exchange_id = envelope["id"]
+        self._capture_wire(
+            ResponsesWireRecord(
+                session_id=session_id,
+                exchange_id=exchange_id,
+                direction="request",
+                sequence=0,
+                content_type="application/json",
+                payload=json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                final=True,
+            )
+        )
         if stream:
-            return await _render_stream(request, envelope)
-        return web.json_response(envelope)
+            sequence = 0
+
+            def capture_chunk(payload: bytes, final: bool) -> None:
+                nonlocal sequence
+                self._capture_wire(
+                    ResponsesWireRecord(
+                        session_id=session_id,
+                        exchange_id=exchange_id,
+                        direction="response",
+                        sequence=sequence,
+                        content_type="text/event-stream",
+                        payload=payload,
+                        final=final,
+                    )
+                )
+                sequence += 1
+
+            return await _render_stream(request, envelope, on_chunk=capture_chunk)
+        payload = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+        self._capture_wire(
+            ResponsesWireRecord(
+                session_id=session_id,
+                exchange_id=exchange_id,
+                direction="response",
+                sequence=0,
+                content_type="application/json",
+                payload=payload,
+                final=True,
+            )
+        )
+        return web.Response(body=payload, content_type="application/json")
+
+    def _capture_wire(self, record: ResponsesWireRecord) -> None:
+        callback = self.wire_capture_callback
+        if callback is not None:
+            callback(record)
 
 
 def _pack_reasoning(text: str) -> str:
@@ -346,7 +423,12 @@ def _response_envelope(body: dict, items: list[dict], in_tok: int, out_tok: int)
     }
 
 
-async def _render_stream(request: web.Request, envelope: dict[str, Any]) -> web.StreamResponse:
+async def _render_stream(
+    request: web.Request,
+    envelope: dict[str, Any],
+    *,
+    on_chunk: Callable[[bytes, bool], None] | None = None,
+) -> web.StreamResponse:
     response = web.StreamResponse(
         status=200,
         headers={
@@ -358,12 +440,15 @@ async def _render_stream(request: web.Request, envelope: dict[str, Any]) -> web.
     await response.prepare(request)
     sequence_number = 0
 
-    async def send(event: dict[str, Any]) -> None:
+    async def send(event: dict[str, Any], *, final: bool = False) -> None:
         nonlocal sequence_number
         event["sequence_number"] = sequence_number
         sequence_number += 1
         payload = json.dumps(event, ensure_ascii=False)
-        await response.write(f"event: {event['type']}\ndata: {payload}\n\n".encode())
+        encoded = f"event: {event['type']}\ndata: {payload}\n\n".encode()
+        if on_chunk is not None:
+            on_chunk(encoded, final)
+        await response.write(encoded)
 
     started = {**envelope, "status": "in_progress", "output": []}
     await send({"type": "response.created", "response": started})
@@ -443,6 +528,6 @@ async def _render_stream(request: web.Request, envelope: dict[str, Any]) -> web.
 
         await send({"type": "response.output_item.done", "output_index": output_index, "item": item})
 
-    await send({"type": "response.completed", "response": envelope})
+    await send({"type": "response.completed", "response": envelope}, final=True)
     await response.write_eof()
     return response

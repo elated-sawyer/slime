@@ -260,6 +260,7 @@ def test_openai_chat_completions_nonstream_records_token_segments():
 
 def test_openai_responses_two_turn_sse_keeps_clean_token_attribution():
     async def run_case():
+        wire_records = []
         first_output = (
             "I will inspect. "
             "<tool_call><function=exec_command><parameter=cmd>ls</parameter></function></tool_call>"
@@ -269,7 +270,11 @@ def test_openai_responses_two_turn_sse_keeps_clean_token_attribution():
             outputs={(10, 11): first_output, (30,): "done"},
         )
         async with FakeSGLangServer([[(-0.2, 10), (-0.3, 11)], [(-0.4, 30)]]) as sglang:
-            adapter = openai_responses.OpenAIResponsesAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
+            adapter = openai_responses.OpenAIResponsesAdapter(
+                tokenizer=tokenizer,
+                sglang_url=sglang.url,
+                wire_capture_callback=wire_records.append,
+            )
             adapter.open_session("sid-r")
             client = TestClient(TestServer(adapter.app))
             await client.start_server()
@@ -327,6 +332,26 @@ def test_openai_responses_two_turn_sse_keeps_clean_token_attribution():
         assert any(name == "response.function_call_arguments.done" for name, _ in first_events)
         assert any(name == "response.completed" for name, _ in second_events)
         assert [event["sequence_number"] for _, event in first_events] == list(range(len(first_events)))
+        request_records = [record for record in wire_records if record.direction == "request"]
+        assert len(request_records) == 2
+        assert all(record.final and record.sequence == 0 for record in request_records)
+        assert all(json.loads(record.payload)["model"] == "m" for record in request_records)
+        response_groups = {
+            exchange_id: [
+                record
+                for record in wire_records
+                if record.direction == "response" and record.exchange_id == exchange_id
+            ]
+            for exchange_id in {record.exchange_id for record in request_records}
+        }
+        assert all(group for group in response_groups.values())
+        assert all(
+            [record.sequence for record in group] == list(range(len(group)))
+            and sum(record.final for record in group) == 1
+            and group[-1].final
+            and b"response.completed" in group[-1].payload
+            for group in response_groups.values()
+        )
         added_items = [payload["item"] for name, payload in first_events if name == "response.output_item.added"]
         assert all(item["status"] == "in_progress" for item in added_items)
         assert all(not item.get("content") for item in added_items if item["type"] in {"reasoning", "message"})
