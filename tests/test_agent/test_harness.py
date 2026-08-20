@@ -171,7 +171,6 @@ def test_codex_responses_root_profile_config_and_launch(monkeypatch):
             captured["env"] = env
             return 0
 
-        monkeypatch.setenv("SLIME_AGENT_CODEX_WIRE_API", "responses")
         sb = FakeSandbox(on_launch=agent)
         ctx = _ctx(
             sid="sess-root",
@@ -179,6 +178,8 @@ def test_codex_responses_root_profile_config_and_launch(monkeypatch):
             home_dir="/root",
             extra_env={"VIRTUAL_ENV": "/opt/task", "OPENAI_API_KEY": "must-not-win"},
             model_context_window=32768,
+            model_label="qwen-baseline",
+            wire_api="responses",
         )
         await CodexHarness().write_config(sb, ctx)
         config_cmd = next(command for command, _ in sb.exec_log if "base64 -d > /root/.codex/config.toml" in command)
@@ -190,12 +191,13 @@ def test_codex_responses_root_profile_config_and_launch(monkeypatch):
 
         assert rc == 0
         assert 'wire_api = "responses"' in toml
+        assert 'model = "qwen-baseline"' in toml
         assert "model_context_window = 32768" in toml
         assert "model_auto_compact_token_limit = 32768" in toml
         assert 'approval_policy = "never"' in toml
         assert 'sandbox_mode = "danger-full-access"' in toml
         first_table = toml.index("[model_providers.slime]")
-        assert toml.index('model = "slime-actor"') < first_table
+        assert toml.index('model = "qwen-baseline"') < first_table
         assert toml.index("model_context_window = 32768") < first_table
         assert toml.index("[history]") > first_table
         assert "codex exec --skip-git-repo-check -- --inspect </dev/null" in next(
@@ -212,9 +214,8 @@ def test_codex_responses_root_profile_config_and_launch(monkeypatch):
 
 def test_codex_rejects_unknown_wire_api(monkeypatch):
     async def run_case():
-        monkeypatch.setenv("SLIME_AGENT_CODEX_WIRE_API", "legacy")
         with pytest.raises(ValueError, match="must be 'chat' or 'responses'"):
-            await CodexHarness().write_config(FakeSandbox(), _ctx())
+            await CodexHarness().write_config(FakeSandbox(), _ctx(wire_api="legacy"))
 
     asyncio.run(run_case())
 

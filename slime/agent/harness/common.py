@@ -57,6 +57,7 @@ class HarnessContext:
     home_dir: str = "/home/agent"
     extra_env: dict[str, str] = field(default_factory=dict)
     model_context_window: int | None = None
+    wire_api: str | None = None
 
 
 class BaseHarness(ABC, metaclass=SingletonABCMeta):
@@ -96,6 +97,8 @@ class BaseHarness(ABC, metaclass=SingletonABCMeta):
         home_dir: str | None = None,
         extra_env: dict[str, str] | None = None,
         model_context_window: int | None = None,
+        model_label: str = "slime-actor",
+        wire_api: str | None = None,
         provision_agent_user: bool = True,
     ) -> int:
         """Run the harness in the sandbox and return its exit code.
@@ -113,10 +116,12 @@ class BaseHarness(ABC, metaclass=SingletonABCMeta):
             workdir=workdir,
             session_id=session_id,
             adapter_url=adapter_url,
+            model_label=model_label,
             execution_user=execution_user,
             home_dir=resolved_home,
             extra_env=dict(extra_env or {}),
             model_context_window=model_context_window,
+            wire_api=wire_api,
         )
         await self.write_config(sb, ctx)
         return await self.launch_and_wait(sb, ctx, prompt, time_budget_sec)

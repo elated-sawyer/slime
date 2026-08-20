@@ -48,8 +48,8 @@ class CodexHarness(BaseHarness):
     )
 
     @classmethod
-    def wire_api(cls) -> str:
-        value = os.environ.get(cls.wire_api_env, "chat").strip().lower()
+    def wire_api(cls, ctx: HarnessContext) -> str:
+        value = (ctx.wire_api or os.environ.get(cls.wire_api_env, "chat")).strip().lower()
         if value not in {"chat", "responses"}:
             raise ValueError(f"{cls.wire_api_env} must be 'chat' or 'responses', got {value!r}")
         return value
@@ -63,7 +63,7 @@ class CodexHarness(BaseHarness):
         )
 
     async def write_config(self, sb: Sandbox, ctx: HarnessContext) -> None:
-        wire_api = self.wire_api()
+        wire_api = self.wire_api(ctx)
         runtime_config = ""
         if wire_api == "responses":
             runtime_config = (
