@@ -559,6 +559,43 @@ def test_max_turns_per_sid_returns_429():
     asyncio.run(run_case())
 
 
+def test_strict_session_mode_rejects_unknown_bearer_before_generation():
+    async def run_case():
+        async with FakeSGLangServer([[(-0.1, 501)]]) as sglang:
+            tok = FakeTokenizer(outputs={(501,): "done"})
+            adapter = openai_responses.OpenAIResponsesAdapter(
+                tokenizer=tok,
+                sglang_url=sglang.url,
+                require_registered_session=True,
+            )
+            adapter.open_session("sid-known")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            body = {"model": "m", "input": "x"}
+            try:
+                unknown = await client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sid-unknown"},
+                    json=body,
+                )
+                unknown_payload = await unknown.json()
+                known = await client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sid-known"},
+                    json=body,
+                )
+            finally:
+                await client.close()
+            await _drain(adapter, "sid-known")
+
+        assert unknown.status == 401
+        assert unknown_payload["error"]["type"] == "invalid_session"
+        assert known.status == 200
+        assert len(sglang.requests) == 1
+
+    asyncio.run(run_case())
+
+
 def test_mid_list_system_folds_into_user():
     body = {
         "messages": [

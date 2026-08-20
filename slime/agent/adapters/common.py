@@ -148,6 +148,7 @@ class BaseAdapter:
         max_turns_per_sid: int | None = None,
         fork_threshold_tokens: int | None = None,
         debug_callback: Callable[..., None] | None = None,
+        require_registered_session: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
@@ -166,6 +167,7 @@ class BaseAdapter:
         self.manager = TrajectoryManager(**mgr_kwargs)
 
         self.debug_callback: Callable[..., None] | None = debug_callback
+        self.require_registered_session = require_registered_session
         # per-sid turn cap: return 429 to kill the run once exceeded
         self.max_turns_per_sid: int | None = max_turns_per_sid
         self._sid_turn_count: dict[str, int] = {}
@@ -328,6 +330,16 @@ class BaseAdapter:
         if sid in self.closed:  # session drained; refuse stragglers
             self.logger.debug("[%s] sid=%s request after session closed", self.log_prefix, sid)
             return web.Response(status=503, text="session closed")
+        if self.require_registered_session and sid not in self.store:
+            return web.json_response(
+                {
+                    "error": {
+                        "type": "invalid_session",
+                        "message": "adapter session is not registered",
+                    }
+                },
+                status=401,
+            )
         capped = self._check_turn_cap(sid)
         if capped is not None:
             return capped
