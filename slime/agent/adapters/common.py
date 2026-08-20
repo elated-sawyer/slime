@@ -473,6 +473,20 @@ def _sampling_params(
     return sp
 
 
+def _sampling_params_for_sglang(params: dict) -> dict:
+    """Translate stable adapter sampling names to SGLang ``/generate`` names."""
+
+    translated = dict(params)
+    seed = translated.pop("seed", None)
+    if seed is None:
+        return translated
+    configured = translated.get("sampling_seed")
+    if configured is not None and configured != seed:
+        raise ValueError("seed and sampling_seed must agree")
+    translated["sampling_seed"] = seed
+    return translated
+
+
 async def call_sglang_generate(
     prompt_ids: list[int],
     session: Any,
@@ -507,6 +521,8 @@ async def call_sglang_generate(
             return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
         sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context)
 
+    sp = _sampling_params_for_sglang(sp)
+
     sglang_url = adapter.sglang_url
     rid = uuid.uuid4().hex
     headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
@@ -539,7 +555,7 @@ async def call_sglang_generate(
         output_ids = [x[1] for x in output_token_logprobs]
         output_log_probs = [float(x[0]) for x in output_token_logprobs]
         finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
-    except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+    except (asyncio.CancelledError, aiohttp.ClientError, TimeoutError) as e:
         # free the sglang slot eagerly on client cancel/timeout, else the
         # orphaned generation keeps occupying KV until its own length cap
         logger.debug("[%s] sid=%s rid=%s turn aborted: %s", adapter.log_prefix, session_id, rid, type(e).__name__)

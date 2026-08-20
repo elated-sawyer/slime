@@ -701,12 +701,14 @@ def test_locked_session_sampling_defaults_cannot_be_overridden_by_wire_body():
         assert locked_sampling["top_p"] == 0.8
         assert locked_sampling["top_k"] == 5
         assert locked_sampling["max_new_tokens"] == 128
-        assert locked_sampling["seed"] == 17
+        assert locked_sampling["sampling_seed"] == 17
+        assert "seed" not in locked_sampling
         assert unset_sampling["temperature"] == 0.9
         assert unset_sampling["top_p"] == 0.1
         assert unset_sampling["top_k"] == 5
         assert unset_sampling["max_new_tokens"] == 64
-        assert unset_sampling["seed"] == 18
+        assert unset_sampling["sampling_seed"] == 18
+        assert "seed" not in unset_sampling
 
     asyncio.run(run_case())
 
