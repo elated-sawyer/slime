@@ -200,9 +200,10 @@ def test_codex_responses_root_profile_config_and_launch(monkeypatch):
         assert toml.index('model = "qwen-baseline"') < first_table
         assert toml.index("model_context_window = 32768") < first_table
         assert toml.index("[history]") > first_table
-        assert "codex exec --skip-git-repo-check -- --inspect </dev/null" in next(
-            value for key, value in sb.files.items() if key.endswith("run.sh")
-        )
+        assert (
+            "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "
+            "--strict-config --json -- --inspect </dev/null"
+        ) in next(value for key, value in sb.files.items() if key.endswith("run.sh"))
         assert next(user for command, user in sb.exec_log if "setsid" in command) == "root"
         assert captured["env"]["HOME"] == "/root"
         assert captured["env"]["CODEX_HOME"] == "/root/.codex"

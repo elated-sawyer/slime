@@ -31,6 +31,7 @@ class CodexHarness(BaseHarness):
     # static flags after ``codex exec``; --skip-git-repo-check lets it run in
     # workdirs whose git check is brittle (e.g. shallow clones)
     exec_flags = "--skip-git-repo-check"
+    responses_exec_flags = "--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --strict-config --json"
 
     # config.toml written into the sandbox. base_url MUST be inline here (Codex
     # only honours env vars for the default OpenAI provider). {model} / {base_url}
@@ -101,7 +102,8 @@ class CodexHarness(BaseHarness):
 
     async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
         # ``codex exec`` is the non-interactive entrypoint
-        cmd = f"codex exec {self.exec_flags}"
+        exec_flags = self.responses_exec_flags if self.wire_api(ctx) == "responses" else self.exec_flags
+        cmd = f"codex exec {exec_flags}"
         extra = os.environ.get(self.extra_args_env, "").strip()
         if extra:
             cmd = f"{cmd} {extra}"
