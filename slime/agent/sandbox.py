@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import random
+import shlex
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -88,6 +89,7 @@ async def exec_and_wait(
     user: str = "root",
     env: dict[str, str] | None = None,
     workdir: str | None = None,
+    home_dir: str | None = None,
     out_file: str | None = None,
     want_output: bool = False,
 ) -> tuple[int, str]:
@@ -108,7 +110,8 @@ async def exec_and_wait(
     done_file = f"/tmp/.{tag}.done"
     launcher = f"/tmp/.{tag}.sh"
     lock_dir = f"/tmp/.{tag}.spawned"
-    prefix = f"cd {workdir}\nexport HOME=/home/{user}\n" if workdir else ""
+    resolved_home = home_dir or ("/root" if user == "root" else f"/home/{user}")
+    prefix = f"cd {shlex.quote(workdir)}\nexport HOME={shlex.quote(resolved_home)}\n" if workdir else ""
     launcher_body = f"#!/bin/bash\n{prefix}{cmd}\necho $? > {done_file}\n"
     await sb.write_file(launcher, launcher_body, user=user)
 

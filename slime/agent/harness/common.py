@@ -18,10 +18,11 @@ from __future__ import annotations
 import asyncio
 import lzma
 import os
+import shlex
 import shutil
 import tempfile
 from abc import ABC, ABCMeta, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from slime.agent import sandbox as _sandbox
@@ -52,6 +53,10 @@ class HarnessContext:
     session_id: str
     adapter_url: str
     model_label: str = "slime-actor"
+    execution_user: str = "agent"
+    home_dir: str = "/home/agent"
+    extra_env: dict[str, str] = field(default_factory=dict)
+    model_context_window: int | None = None
 
 
 class BaseHarness(ABC, metaclass=SingletonABCMeta):
@@ -87,6 +92,11 @@ class BaseHarness(ABC, metaclass=SingletonABCMeta):
         adapter_url: str,
         time_budget_sec: int,
         prompt: str,
+        execution_user: str = "agent",
+        home_dir: str | None = None,
+        extra_env: dict[str, str] | None = None,
+        model_context_window: int | None = None,
+        provision_agent_user: bool = True,
     ) -> int:
         """Run the harness in the sandbox and return its exit code.
 
@@ -94,26 +104,50 @@ class BaseHarness(ABC, metaclass=SingletonABCMeta):
         Workspace prep (writing the problem statement etc.) is the caller's job
         and must run before this.
         """
-        await _sandbox.ensure_agent_user(sb, workdir)
+        if provision_agent_user:
+            if execution_user != "agent":
+                raise ValueError("provision_agent_user=True only provisions the default 'agent' user")
+            await _sandbox.ensure_agent_user(sb, workdir)
+        resolved_home = home_dir or ("/root" if execution_user == "root" else f"/home/{execution_user}")
         ctx = HarnessContext(
             workdir=workdir,
             session_id=session_id,
             adapter_url=adapter_url,
+            execution_user=execution_user,
+            home_dir=resolved_home,
+            extra_env=dict(extra_env or {}),
+            model_context_window=model_context_window,
         )
         await self.write_config(sb, ctx)
         return await self.launch_and_wait(sb, ctx, prompt, time_budget_sec)
 
 
-async def run_agent(sb: Sandbox, *, workdir: str, start_cmd: str, env: dict[str, str], time_budget_sec: int) -> int:
+async def run_agent(
+    sb: Sandbox,
+    *,
+    workdir: str,
+    start_cmd: str,
+    env: dict[str, str],
+    time_budget_sec: int,
+    user: str = "agent",
+    home_dir: str | None = None,
+) -> int:
     """Launch the agent (start_cmd) and run it to completion, returning its exit code."""
     meta_dir = f"{workdir}/.harness"
-    await sb.exec(f"mkdir -p {meta_dir} && chown agent:agent {meta_dir}", user="root", check=True, timeout=30)
+    await sb.exec(
+        f"mkdir -p {shlex.quote(meta_dir)} && "
+        f"chown {shlex.quote(f'{user}:{user}')} {shlex.quote(meta_dir)}",
+        user="root",
+        check=True,
+        timeout=30,
+    )
     exit_code, _ = await exec_and_wait(
         sb,
         cmd=start_cmd,
-        user="agent",
+        user=user,
         env=env,
         workdir=workdir,
+        home_dir=home_dir,
         out_file=f"{meta_dir}/trajectory.jsonl",
         time_budget_sec=time_budget_sec,
         tag="run",

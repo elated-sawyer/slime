@@ -25,10 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer  # noqa: E402
+from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer, ScriptedTokenizer  # noqa: E402
 
-from slime.agent.adapters import anthropic, openai  # noqa: E402
-from slime.agent.parsing import parse_model_output, parse_xml_tool_uses  # noqa: E402
+from slime.agent.adapters import anthropic, openai, openai_responses  # noqa: E402
+from slime.agent.parsing import ParsedModelOutput, parse_model_output, parse_xml_tool_uses  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
 NUM_GPUS = 0
@@ -160,6 +160,34 @@ def test_openai_translation_developer_to_system_and_tool_calls_to_dict():
     ]
 
 
+def test_responses_items_roundtrip_mixed_text_reasoning_and_function_call():
+    parsed = ParsedModelOutput(
+        reasoning="inspect first",
+        text="I will check. ",
+        tool_uses=[{"name": "exec_command", "input": {"cmd": "ls"}}],
+    )
+    output = openai_responses._output_items(parsed, "stop")
+    messages = openai_responses._input_items_to_messages(
+        [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "rules"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "solve"}]},
+            *output,
+            {"type": "function_call_output", "call_id": output[-1]["call_id"], "output": "file.txt"},
+        ]
+    )
+
+    assert messages == [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "solve"},
+        openai_responses._manager_message(parsed),
+        {"role": "tool", "content": "file.txt"},
+    ]
+    assistant = messages[2]
+    assert assistant["content"] == "I will check. "
+    assert assistant["reasoning_content"] == "inspect first"
+    assert assistant["tool_calls"][0]["function"]["arguments"] == {"cmd": "ls"}
+
+
 # ===========================================================================
 # §3 non-stream JSON + token capture (real HTTP, real /generate)
 # ===========================================================================
@@ -226,6 +254,110 @@ def test_openai_chat_completions_nonstream_records_token_segments():
         assert data["choices"][0]["finish_reason"] == "stop"
         assert sglang.requests[0]["sampling_params"]["max_new_tokens"] == 4
         assert len(samples) == 1 and samples[0].tokens[-1] == 201 and samples[0].loss_mask[-1] == 1
+
+    asyncio.run(run_case())
+
+
+def test_openai_responses_two_turn_sse_keeps_clean_token_attribution():
+    async def run_case():
+        first_output = (
+            "I will inspect. "
+            "<tool_call><function=exec_command><parameter=cmd>ls</parameter></function></tool_call>"
+        )
+        tokenizer = ScriptedTokenizer(
+            prompts=[[1, 2], [1, 2, 10, 11, 20]],
+            outputs={(10, 11): first_output, (30,): "done"},
+        )
+        async with FakeSGLangServer([[(-0.2, 10), (-0.3, 11)], [(-0.4, 30)]]) as sglang:
+            adapter = openai_responses.OpenAIResponsesAdapter(tokenizer=tokenizer, sglang_url=sglang.url)
+            adapter.open_session("sid-r")
+            client = TestClient(TestServer(adapter.app))
+            await client.start_server()
+            base_input = [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "rules"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "solve"}]},
+            ]
+            tools = [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "run a command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                },
+                {"type": "web_search"},
+            ]
+            try:
+                first = await client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sid-r"},
+                    json={"model": "m", "stream": True, "input": base_input, "tools": tools},
+                )
+                first_events = _parse_sse(await first.text())
+                first_completed = next(
+                    payload for name, payload in first_events if name == "response.completed"
+                )["response"]
+                function_call = next(item for item in first_completed["output"] if item["type"] == "function_call")
+
+                second = await client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sid-r"},
+                    json={
+                        "model": "m",
+                        "stream": True,
+                        "input": [
+                            *base_input,
+                            *first_completed["output"],
+                            {
+                                "type": "function_call_output",
+                                "call_id": function_call["call_id"],
+                                "output": "a.txt",
+                            },
+                        ],
+                        "tools": tools,
+                    },
+                )
+                second_events = _parse_sse(await second.text())
+            finally:
+                await client.close()
+            samples = await _drain(adapter, "sid-r")
+
+        assert first.status == 200 and second.status == 200
+        assert "text/event-stream" in first.headers["Content-Type"]
+        assert first_completed["status"] == "completed"
+        assert any(name == "response.function_call_arguments.done" for name, _ in first_events)
+        assert any(name == "response.completed" for name, _ in second_events)
+        assert [event["sequence_number"] for _, event in first_events] == list(range(len(first_events)))
+        added_items = [payload["item"] for name, payload in first_events if name == "response.output_item.added"]
+        assert all(item["status"] == "in_progress" for item in added_items)
+        assert all(not item.get("content") for item in added_items if item["type"] in {"reasoning", "message"})
+        assert all(not item.get("arguments") for item in added_items if item["type"] == "function_call")
+        assert sglang.routing_keys == ["sid-r", "sid-r"]
+        assert tokenizer.rendered[0][1] == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "description": "run a command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                },
+            }
+        ]
+        replayed_assistant = next(
+            message for message in tokenizer.rendered[1][0] if message.get("role") == "assistant"
+        )
+        assert replayed_assistant["content"] == "I will inspect."
+        assert replayed_assistant["tool_calls"][0]["function"]["arguments"] == {"cmd": "ls"}
+        assert len(samples) == 1
+        assert sum(samples[0].loss_mask) == 3
+        assert [
+            value
+            for value, mask in zip(samples[0].rollout_log_probs, samples[0].loss_mask, strict=True)
+            if mask
+        ] == [
+            -0.2,
+            -0.3,
+            -0.4,
+        ]
 
     asyncio.run(run_case())
 

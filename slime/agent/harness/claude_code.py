@@ -44,11 +44,14 @@ class ClaudeCodeHarness(BaseHarness):
     async def write_config(self, sb: Sandbox, ctx: HarnessContext) -> None:
         """Pre-ack bypass-permissions so claude-code starts headless."""
         settings = json.dumps({"hasCompletedOnboarding": True, "bypassPermissionsModeAccepted": True})
+        config_dir = f"{ctx.home_dir}/.claude"
+        state_path = f"{ctx.home_dir}/.claude.json"
         await sb.exec(
-            "mkdir -p /home/agent/.claude && "
+            f"mkdir -p {shlex.quote(config_dir)} && "
             f"echo {shlex.quote(settings)} "
-            "| tee /home/agent/.claude.json /home/agent/.claude/settings.json > /dev/null && "
-            "chown -R agent:agent /home/agent/.claude /home/agent/.claude.json",
+            f"| tee {shlex.quote(state_path)} {shlex.quote(f'{config_dir}/settings.json')} > /dev/null && "
+            f"chown -R {shlex.quote(f'{ctx.execution_user}:{ctx.execution_user}')} "
+            f"{shlex.quote(config_dir)} {shlex.quote(state_path)}",
             user="root",
             check=True,
             timeout=60,
@@ -59,13 +62,31 @@ class ClaudeCodeHarness(BaseHarness):
         extra = os.environ.get(self.extra_args_env, "").strip()
         if extra:
             cmd = f"{cmd} {extra}"
-        env = {
-            "ANTHROPIC_BASE_URL": ctx.adapter_url,
-            "ANTHROPIC_AUTH_TOKEN": ctx.session_id,
-            "ANTHROPIC_MODEL": ctx.model_label,
-            **self.static_env,
-        }
+        env: dict[str, str] = {}
         extra_envs = os.environ.get(self.extra_envs_env, "").strip()
         if extra_envs:
-            env.update(json.loads(extra_envs))
-        return await run_agent(sb, workdir=ctx.workdir, start_cmd=cmd, env=env, time_budget_sec=time_budget_sec)
+            configured = json.loads(extra_envs)
+            if not isinstance(configured, dict) or not all(
+                isinstance(key, str) and isinstance(value, str) for key, value in configured.items()
+            ):
+                raise ValueError(f"{self.extra_envs_env} must be a JSON object of string values")
+            env.update(configured)
+        env.update(ctx.extra_env)
+        env.update(
+            {
+                "HOME": ctx.home_dir,
+                "ANTHROPIC_BASE_URL": ctx.adapter_url,
+                "ANTHROPIC_AUTH_TOKEN": ctx.session_id,
+                "ANTHROPIC_MODEL": ctx.model_label,
+                **self.static_env,
+            }
+        )
+        return await run_agent(
+            sb,
+            workdir=ctx.workdir,
+            start_cmd=cmd,
+            env=env,
+            time_budget_sec=time_budget_sec,
+            user=ctx.execution_user,
+            home_dir=ctx.home_dir,
+        )

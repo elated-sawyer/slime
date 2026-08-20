@@ -39,8 +39,8 @@ async def _fast_sleep(_secs):
     await _REAL_SLEEP(0)
 
 
-def _ctx(workdir="/workspace/repo", sid="sess-1", url="http://host:18001") -> HarnessContext:
-    return HarnessContext(workdir=workdir, session_id=sid, adapter_url=url)
+def _ctx(workdir="/workspace/repo", sid="sess-1", url="http://host:18001", **kwargs) -> HarnessContext:
+    return HarnessContext(workdir=workdir, session_id=sid, adapter_url=url, **kwargs)
 
 
 def _find(exec_log, needle):
@@ -159,6 +159,62 @@ def test_codex_write_config_base64_roundtrips_inline_base_url():
         assert 'base_url = "http://host:18001/v1"' in toml  # MUST be inline
         assert 'wire_api = "chat"' in toml
         assert 'model_provider = "slime"' in toml
+
+    asyncio.run(run_case())
+
+
+def test_codex_responses_root_profile_config_and_launch(monkeypatch):
+    async def run_case():
+        captured = {}
+
+        async def agent(env):
+            captured["env"] = env
+            return 0
+
+        monkeypatch.setenv("SLIME_AGENT_CODEX_WIRE_API", "responses")
+        sb = FakeSandbox(on_launch=agent)
+        ctx = _ctx(
+            sid="sess-root",
+            execution_user="root",
+            home_dir="/root",
+            extra_env={"VIRTUAL_ENV": "/opt/task", "OPENAI_API_KEY": "must-not-win"},
+            model_context_window=32768,
+        )
+        await CodexHarness().write_config(sb, ctx)
+        config_cmd = next(command for command, _ in sb.exec_log if "base64 -d > /root/.codex/config.toml" in command)
+        encoded = config_cmd.split("echo ")[1].split(" | base64")[0].strip("'")
+        toml = base64.b64decode(encoded).decode()
+
+        with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
+            rc = await CodexHarness().launch_and_wait(sb, ctx, prompt="--inspect", time_budget_sec=30)
+
+        assert rc == 0
+        assert 'wire_api = "responses"' in toml
+        assert "model_context_window = 32768" in toml
+        assert "model_auto_compact_token_limit = 32768" in toml
+        assert 'approval_policy = "never"' in toml
+        assert 'sandbox_mode = "danger-full-access"' in toml
+        first_table = toml.index("[model_providers.slime]")
+        assert toml.index('model = "slime-actor"') < first_table
+        assert toml.index("model_context_window = 32768") < first_table
+        assert toml.index("[history]") > first_table
+        assert "codex exec --skip-git-repo-check -- --inspect </dev/null" in next(
+            value for key, value in sb.files.items() if key.endswith("run.sh")
+        )
+        assert next(user for command, user in sb.exec_log if "setsid" in command) == "root"
+        assert captured["env"]["HOME"] == "/root"
+        assert captured["env"]["CODEX_HOME"] == "/root/.codex"
+        assert captured["env"]["VIRTUAL_ENV"] == "/opt/task"
+        assert captured["env"]["OPENAI_API_KEY"] == "sess-root"
+
+    asyncio.run(run_case())
+
+
+def test_codex_rejects_unknown_wire_api(monkeypatch):
+    async def run_case():
+        monkeypatch.setenv("SLIME_AGENT_CODEX_WIRE_API", "legacy")
+        with pytest.raises(ValueError, match="must be 'chat' or 'responses'"):
+            await CodexHarness().write_config(FakeSandbox(), _ctx())
 
     asyncio.run(run_case())
 
