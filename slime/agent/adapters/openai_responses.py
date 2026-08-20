@@ -35,6 +35,8 @@ _CONTEXT_CUTOFF_TEXT = (
     "I have reached the context budget for this task and must stop. "
     "The files already written in the workspace are my final answer."
 )
+_SYSTEM_REMINDER_PREFIX = "<system-reminder>\n"
+_SYSTEM_REMINDER_SUFFIX = "\n</system-reminder>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +96,7 @@ class OpenAIResponsesAdapter(BaseAdapter):
                 messages.append({"role": "user", "content": input_data})
         else:
             messages.extend(_input_items_to_messages(input_data))
+        messages = _normalize_system_messages(messages)
 
         tools = body.get("tools")
         if tools is not None and not isinstance(tools, list):
@@ -207,6 +210,49 @@ def _content_text(value: Any) -> str:
     if isinstance(value, dict):
         return flatten_content([value])
     return flatten_content(value)
+
+
+def _normalize_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one leading system message without reordering later history.
+
+    Responses clients may send both top-level ``instructions`` and developer
+    items, including developer items in the middle of replayed history. Many
+    model chat templates accept only one leading system message. Consecutive
+    leading system messages are therefore merged, while later system messages
+    stay at their original position as explicit user-visible reminders.
+    """
+
+    leading_system: list[str] = []
+    first_non_system = 0
+    while first_non_system < len(messages):
+        message = messages[first_non_system]
+        if message.get("role") != "system":
+            break
+        content = flatten_content(message.get("content"))
+        if content:
+            leading_system.append(content)
+        first_non_system += 1
+
+    normalized: list[dict[str, Any]] = []
+    if leading_system:
+        normalized.append(
+            {"role": "system", "content": "\n\n".join(leading_system)}
+        )
+    for message in messages[first_non_system:]:
+        if message.get("role") != "system":
+            normalized.append(message)
+            continue
+        normalized.append(
+            {
+                "role": "user",
+                "content": (
+                    _SYSTEM_REMINDER_PREFIX
+                    + flatten_content(message.get("content"))
+                    + _SYSTEM_REMINDER_SUFFIX
+                ),
+            }
+        )
+    return normalized
 
 
 def _tool_output_text(value: Any) -> str:

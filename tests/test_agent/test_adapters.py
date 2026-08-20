@@ -188,6 +188,54 @@ def test_responses_items_roundtrip_mixed_text_reasoning_and_function_call():
     assert assistant["tool_calls"][0]["function"]["arguments"] == {"cmd": "ls"}
 
 
+def test_responses_translation_normalizes_system_messages_without_reordering_history():
+    adapter = openai_responses.OpenAIResponsesAdapter(
+        tokenizer=object(),
+        sglang_url="http://127.0.0.1:1",
+    )
+    translated, tools = adapter._translate(
+        {
+            "instructions": "top-level instructions",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "leading developer"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "solve"}],
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "late developer"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                },
+            ],
+        }
+    )
+
+    assert tools is None
+    assert translated == [
+        {
+            "role": "system",
+            "content": "top-level instructions\n\nleading developer",
+        },
+        {"role": "user", "content": "solve"},
+        {
+            "role": "user",
+            "content": "<system-reminder>\nlate developer\n</system-reminder>",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+
+
 # ===========================================================================
 # §3 non-stream JSON + token capture (real HTTP, real /generate)
 # ===========================================================================
